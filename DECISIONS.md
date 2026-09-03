@@ -3,7 +3,7 @@
 **Context:** Isolated home lab built as the foundation for an 18-week AI security
 curriculum (modules M0–M7).
 **Host:** Mac mini, Apple M1, 16 GB RAM, macOS, 512 GB SSD.
-**Established:** 2026-08-31
+**Established:** 2026-08-31 · **Last updated:** 2026-09-03
 
 Format for each decision: **Decision → Rationale → Rejected alternatives**
 
@@ -81,18 +81,16 @@ Elastic indices are in play.
 | Private to my Mac | host-only, isolated lab segment | attacker → target traffic, packet capture |
 | Bridged (Autodetect/Wi-Fi/Ethernet) | VM exposed on the home LAN | **never used** |
 
-Subnets assigned by Fusion via DHCP:
+Subnets assigned by Fusion:
 
-- **NAT** — `172.16.110.0/24`, gateway `172.16.110.2`
+- **NAT** — `172.16.110.0/24`, gateway `172.16.110.2`, DHCP
 - **Host-only** — `172.16.124.0/24`, host (Mac) at `172.16.124.1`
 
-VM addresses (as of 2026-09-01; DHCP-assigned, may change across reboots):
-
-| VM | Interfaces | NAT | Host-only |
+| VM | Interfaces | NAT (DHCP) | Host-only (static) |
 |---|---|---|---|
-| Ubuntu Server | enp2s0 / enp26s0 | 172.16.110.130 | 172.16.124.128 |
-| Kali | eth0 / eth1 | 172.16.110.128 | 172.16.124.129 |
-| Windows 11 | — | TBD | TBD |
+| Ubuntu Server | enp2s0 / enp26s0 | 172.16.110.130 | **172.16.124.10** |
+| Kali | eth0 / eth1 | 172.16.110.128 | **172.16.124.11** |
+| Windows 11 | — | DHCP | TBD |
 
 ### Why host-only rather than NAT alone
 
@@ -111,6 +109,42 @@ Network" would be the equivalent) — it cuts the lab off from the router and ot
 household devices, but the host remains reachable. Accepted deliberately, since
 packet capture and host access to lab services both depend on it.
 
+### Static addressing on the lab segment
+
+DHCP leases shift across reboots, which makes them unusable for agent-based
+tooling that stores the manager's address in its configuration — a hard
+requirement once Wazuh is deployed in M2. Addresses `.10` and `.11` sit below
+Fusion's DHCP pool (which begins around `.128`), so a conflict is not possible.
+
+NAT interfaces stay on DHCP: there is no benefit to fighting Fusion's DHCP server
+for addresses on a segment whose only job is reaching the internet.
+
+**Neither host declares a gateway on the lab interface.** The absence of a
+default route is the mechanism that keeps the segment isolated, and `ip route` is
+how it is verified rather than assumed:
+
+```
+default via 172.16.110.2 dev enp2s0 proto dhcp src 172.16.110.130 metric 100
+172.16.124.0/24 dev enp26s0 proto kernel scope link src 172.16.124.10
+```
+
+Exactly one default route, on the NAT interface. The lab interface carries only a
+`scope link` route to its own subnet — directly reachable via ARP, no router
+involved. The kernel resolves this by longest-prefix match, so traffic to
+`172.16.124.x` takes the specific route while everything else falls through to
+the default.
+
+Ubuntu is configured through netplan, in a separate file
+(`/etc/netplan/60-lab-static.yaml`) so the cloud-init file managing the NAT
+interface stays untouched; `netplan try` applies changes with an automatic
+rollback if connectivity breaks. Kali is configured through a NetworkManager
+profile bound to the NIC:
+
+```bash
+nmcli connection add type ethernet con-name lab ifname eth1 \
+  ipv4.method manual ipv4.addresses 172.16.124.11/24
+```
+
 ### Cost of running two adapters
 
 Tools pick an interface on their own, so they must be pointed explicitly:
@@ -125,29 +159,22 @@ an address from the router. Maximum exposure, no benefit for this lab.
 **Kali: one NetworkManager profile shared across two NICs.** After adding the
 second adapter, `eth1` came up at layer 2 but had no IP address (layer 3
 unconfigured), showing as `disconnected`. Running `nmcli device connect eth1`
-activated the existing "Wired connection 1" profile, which is not pinned to any
+activated the existing "Wired connection 1" profile, which is not bound to any
 device — so the profile hopped between `eth0` and `eth1`, always leaving one NIC
-without an address. Fix: one profile per NIC, pinned with `ifname`:
+without an address. The fix is one profile per NIC, pinned with `ifname`.
 
-```bash
-nmcli connection add type ethernet con-name nat ifname eth0
-nmcli connection add type ethernet con-name lab ifname eth1
-nmcli connection up nat && nmcli connection up lab
-```
-
-Profiles persist in `/etc/NetworkManager/system-connections/`, so both NICs come
-up correctly after a reboot.
+**A wrong conclusion drawn along the way, worth recording.** After a reboot both
+Kali NICs appeared to work, which was read as confirmation that the per-NIC
+profiles had been created successfully. `nmcli connection show` later showed no
+such profiles existed — `eth1` was simply `disconnected`, and the apparent
+success was the old single-profile behaviour reasserting itself. Verifying the
+intended mechanism, rather than the symptom, would have caught this immediately.
 
 **Ubuntu** configured its second interface automatically — it uses
-netplan/systemd-networkd rather than NetworkManager.
-
-**Verification** (`ip route`): exactly one default route, via the NAT interface.
-The host-only interface carries only a route to its own subnet; the absence of a
-default route there confirms nothing leaves the lab through that NIC.
-
-**Checkpoint for M2:** addresses are DHCP-assigned. Before installing Wazuh,
-assign a static address to the manager (Ubuntu) on the host-only segment, since
-agents store the manager's IP in their configuration.
+netplan/systemd-networkd rather than NetworkManager. Interface naming also
+differs between the two distributions (`eth0`/`eth1` on Kali, predictable names
+like `enp2s0`/`enp26s0` on Ubuntu), which is easy to confuse when selecting a
+capture interface.
 
 ---
 
@@ -156,13 +183,19 @@ agents store the manager's IP in their configuration.
 - A **`clean`** snapshot after each OS installation and first full update, taken
   with the **VM powered off** — on a 16 GB host, snapshotting a running VM also
   captures memory state, making it larger and slower.
-- A snapshot **before** any exercise that changes the system in ways that are
-  hard to undo: Wazuh/Elastic installation in M2, deliberate host infection,
-  Defender configuration experiments.
-- Naming convention: `YYYY-MM-DD-description`
-  (e.g. `2026-09-01-clean-post-install`).
+- A snapshot **before** any change that is hard to undo: Wazuh/Elastic
+  installation in M2, deliberate host infection, Defender configuration
+  experiments.
+- Naming convention: `YYYY-MM-DD-description`.
 - Review and prune snapshots once per module — otherwise disk usage becomes a
   problem around M2.
+
+Snapshots taken so far:
+
+| Snapshot | State captured |
+|---|---|
+| `2026-09-01-clean-post-install` | base OS, fully updated |
+| `2026-09-03-lab-network-configured` | static addressing, isolation verified |
 
 ---
 
@@ -178,3 +211,12 @@ target exercises always involve a pair.
 
 All three VMs are **installed**; the constraint applies only to how many run
 simultaneously.
+
+---
+
+## Open items
+
+- Windows 11: static address on the lab segment, audit policy configuration
+  (logon events, process creation).
+- Static addressing to be revisited if additional hosts join the lab segment in
+  M2 — current allocation reserves `.10`–`.20` for infrastructure.
